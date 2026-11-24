@@ -1,0 +1,454 @@
+# A deployed, non-interactive configuration -- what B3-EC27 requires for B3-D3.
+# Covers: B3-EC27.
+#
+# Airflow as three services, following the official layout: init, scheduler,
+# webserver. "airflow standalone" was ruled out: it builds its own admin user
+# with a random password, and Airflow's own documentation calls it unsuitable
+# outside development. More importantly, a scheduler started in the background
+# of another process can die unnoticed -- and it is the scheduler that carries
+# the demonstration of B3-C3.
+
+# Docker Compose prefixes containers AND volumes with this name, so pgdata
+# here is aia-ml4fd_pgdata and NOT the aia-fraud-detection_pgdata of BC03
+# (that project keeps its name: it is BC03's, and it still exists).
+# Renaming it is what keeps this stack off BC03's data; the volume names
+# below need no change. The published ports are still BC03's, so the two
+# stacks must not run at the same time.
+name: aia-ml4fd
+
+x-airflow-common: &airflow-common
+  build: ./airflow
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # L1: THE METADATA HAS ITS OWN DATABASE AND ITS OWN ROLE. Neither
+    # ${POSTGRES_DB} nor the owner any more: fd_airflow owns the airflow
+    # database and is refused CONNECT on the business one
+    # (sql/initdb/010_databases.sh, sql/ddl/150_database_connect.sql).
+    # Whoever can run a DAG no longer holds owner rights on the ml4fd
+    # tables through this connection string.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://fd_airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # Fixed, so webserver sessions survive a restart. A demonstration value:
+    # to be externalised if the infrastructure ever leaves this machine.
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:?AIRFLOW_SECRET_KEY is missing from .env -- run .\fd-manager.ps1 setup}
+    PYTHONPATH: /opt/project
+    # THE BUSINESS DATABASE, and it shares nothing with the metadata
+    # connection above any more (L1). These three are what the ml4fd/
+    # package builds its own connection from: as the owner, to
+    # ${POSTGRES_DB}, where it then issues SET ROLE. Airflow's scheduler
+    # reaches its metadata as fd_airflow, and fd_airflow cannot open a
+    # connection here at all.
+    POSTGRES_HOST: postgres
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB: ${POSTGRES_DB}
+    ML4FD_PEPPER: ${ML4FD_PEPPER}
+    # The corpora's private bucket, and the credentials boto3 reads by
+    # itself. Empty when the cache is warm, which is the usual case.
+    ML4FD_CORPUS_BUCKET: ${ML4FD_CORPUS_BUCKET:-}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-3}
+    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI}
+    # MLflow looks for a git SHA to tag the run with and prints three paragraphs
+    # when git is absent. There is no repository in this image and the chain of
+    # provenance is carried by run.json, not by a commit.
+    GIT_PYTHON_REFRESH: quiet
+  volumes: &airflow-volumes
+    # SHARED by the three services. Under LocalExecutor the tasks run in the
+    # scheduler, which writes its logs there; without the share the webserver
+    # looks in its own filesystem and finds nothing -- the interface then
+    # reports that it cannot fetch the log.
+    - airflow-logs:/opt/airflow/logs
+    - ./airflow/dags:/opt/airflow/dags
+    - ./ml4fd:/opt/project/ml4fd
+    - ./sql:/opt/project/sql
+    - ./tools:/opt/project/tools
+    # NO ws/ MOUNT, and the five minutes of real API calls that its absence
+    # once cost are why this line is worth a comment. N0 wrote its measurement
+    # there; since R13 it writes under runtime/observations/, which the
+    # runtime/ mount covers. ws/ now holds only what is written by hand -- the
+    # plans, the mockups -- which no container reads.
+    - ./governance.yml:/opt/project/governance.yml:ro
+    # Local cache, hidden and named as such: it holds the downloaded CSV and
+    # the conf files handed to airflow dags trigger. Nothing here is a source --
+    # fetch_csv re-downloads on a sha256 mismatch.
+    - ./.local_cache:/opt/project/.local_cache
+    # runtime/ holds everything this stack PRODUCES: the datasets, the morning
+    # documents, and the two notification channels. ONE mount covers the four
+    # declared paths, which is the point -- each of them had to be mounted
+    # separately, and each omission cost something.
+    # DECLARED IN governance.yml IS NOT ENOUGH, and this line is why:
+    # /opt/project is a directory of the IMAGE, not a volume, so a path
+    # declared under it without a mount here fails with
+    # "PermissionError: [Errno 13] /opt/project/runtime/reports" the first time
+    # the report is produced. Three directories were paid for that way -- 28
+    # real observations, a whole dataset, then the reports.
+    # tests/test_mounts.py holds every declared path to this list.
+    - ./runtime:/opt/project/runtime
+    # NO mlruns mount here, deliberately. The mlflow server now proxies the
+    # artifacts (--serve-artifacts in mlflow/Dockerfile), so the Airflow
+    # container POSTs them over HTTP and never touches that filesystem.
+    #
+    # Mounting the volume here WAS the first attempt, and it failed on uids: a
+    # directory created by the mlflow container is not writable by uid 50000.
+    # Sharing a filesystem between two images is a permissions problem waiting
+    # to happen; proxying removes the filesystem from the question.
+
+services:
+  postgres:
+    image: postgres:16
+    # BACK AFTER A RESTART OF DOCKER ITSELF, like every long-running service of
+    # this stack. On 2026-11-22 Docker Desktop restarted; the services that had
+    # this line came back, this one did not, and the scoring service then
+    # failed to resolve its name -- the stack looked up and was not.
+    restart: unless-stopped
+    # SHARED MEMORY, and 64 MB is not enough. Docker gives a container that
+    # much /dev/shm by default, and PostgreSQL's parallel workers allocate
+    # their segments there: a parallel VACUUM on fd_transactions asked for
+    # 67,145,248 bytes and was refused with "No space left on device"
+    # (2026-11-19). The number is the default, to the byte.
+    #
+    # It did not show on the former corpus: 555,719 rows planned without
+    # parallel workers. At 1,296,675 the planner reaches for them, and the
+    # limit it meets has nothing to do with the disk the message names.
+    #
+    # One gigabyte rather than a tight fit: the segments are transient, the
+    # host reclaims what is unused, and the next corpus should not bring this
+    # back. Recreating this container does NOT touch pgdata -- the data lives
+    # in a named volume.
+    shm_size: '1gb'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Read by sql/initdb/010_databases.sh, which runs before the server
+      # accepts an outside connection. Nowhere else: the two service roles
+      # are created once, at first boot.
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/work/sql:ro               # for psql -f /work/sql/...
+      # FIRST BOOT ONLY. The entrypoint plays this directory when the data
+      # directory is empty, which is early enough for airflow-init to find
+      # its database during `up`. sql/ddl would be too late: `init` runs
+      # after.
+      - ./sql/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      # HOST PORTS ARE THE 8**2 FAMILY, every one of them: 8432, 8082, 8002,
+      # 8802, 8502, 8012. The BC03 stack publishes 5432, 8080, 5000 and 8501
+      # on this same machine, and the two must be able to run side by side.
+      # Only the HOST side moved; inside the network every service keeps its
+      # own port, so no endpoint in governance.yml changes.
+      - "8432:5432"                      # the PostgreSQL protocol, not HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+
+  # Migrates Airflow's schema and creates the user. Exits once done.
+  airflow-init:
+    <<: *airflow-common
+    # ITS OWN environment, and the anchor merged back in: a service that writes
+    # `environment:` REPLACES the inherited map rather than adding to it, so
+    # without <<: *airflow-env this service would lose every AIRFLOW__ setting.
+    # The admin password is needed here only -- the one service that creates
+    # the account -- and nowhere else.
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD is missing from .env -- run .\fd-manager.ps1 setup}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create --username admin --password "$$AIRFLOW_ADMIN_PASSWORD" \
+          --firstname admin --lastname admin --role Admin \
+          --email admin@example.com || true
+
+  airflow-scheduler:
+    <<: *airflow-common
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    command: scheduler
+
+  airflow-webserver:
+    <<: *airflow-common
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    command: webserver
+    ports:
+      - "8082:8080"
+
+  mlflow:
+    build: ./mlflow
+    # BACK AFTER A RESTART OF DOCKER ITSELF, like every long-running service of
+    # this stack. On 2026-11-22 Docker Desktop restarted; the services that had
+    # this line came back, this one did not, and the scoring service then
+    # failed to resolve its name -- the stack looked up and was not.
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # The CMD in mlflow/Dockerfile requires these two variables: left empty,
+      # the first flag swallows the second and the server never starts.
+      #
+      # L1: A POSTGRESQL STORE. It was SQLite, and the comment that justified
+      # it had gone stale -- psycopg2-binary IS in mlflow/requirements.txt,
+      # so the import it feared cannot fail. SQLite would still hold at this
+      # scale; the move is for what comes next, since L3 makes the registry
+      # the point of contact between the code loop and the model loop.
+      #
+      # THE ARTIFACTS DO NOT MOVE. They stay on the mlruns volume, served by
+      # this container; only the metadata changes store.
+      MLFLOW_BACKEND_STORE_URI: postgresql+psycopg2://fd_mlflow:${MLFLOW_DB_PASSWORD}@postgres/mlflow
+      MLFLOW_ARTIFACT_ROOT: /mlruns/artifacts
+    volumes:
+      - mlruns:/mlruns
+    ports:
+      - "8002:5000"
+
+  # THE DASHBOARD OF S6 (lot R4). The one container a browser talks to, so it
+  # is built to be UNABLE rather than careful:
+  #
+  #   - it does NOT reuse x-airflow-common. That anchor carries the owner's
+  #     POSTGRES_PASSWORD and ML4FD_PEPPER; the dashboard receives neither.
+  #     It gets fd_dashboard's credentials UNDER THE SAME VARIABLE NAMES, so
+  #     ml4fd/config.py reads them unchanged -- and ml4fd/dashboard.py refuses
+  #     to serve if PostgreSQL says the session is anybody else;
+  #   - every mount is READ-ONLY. It reads runtime/reports/ and could not
+  #     alter one, and it mounts nothing else of runtime/;
+  #   - the port is bound to 127.0.0.1: this machine, not the network. The day
+  #     it leaves this machine it needs an authenticating front end first;
+  #   - no Linux capability, no privilege escalation, a non-root user.
+  #
+  # The documents are mounted at THE SAME PATH as in Airflow
+  # (/opt/project/runtime/reports):
+  # report.path_for() then names the same file in both containers. A different
+  # mount is the defect that cost 28 observations and a dataset, and the
+  # morning page reports it if it ever happens.
+  # ----------------------------------------------------------- the producer
+  # THE STREAM THIS PROJECT READS. producer/ is derived from the exercise's own
+  # application, which vendor/realtime-transactions-producer holds untouched:
+  # the FastAPI route, the slowapi limiter, the df.sample() and above all the
+  # df.to_json(orient="split") that produces the response are theirs. That last
+  # one is why there is no fidelity to argue about -- the shape is not
+  # reproduced, it is produced by the same call.
+  #
+  # ITS THREE DEFECTS ARE REPAIRED, and producer/app.py carries the detail: it
+  # re-read 150 MB from a public mirror on every call (750 MB a minute of
+  # somebody else's egress, and the +5.1 s clock gap N0 measured -- since
+  # measured at +0.0 s against the producer, the stamp and our call being
+  # read off the same clock), it sampled
+  # the whole corpus so the periods averaged together and no drift could ever
+  # show, and its "/" route answered 500 on a directory named in the singular.
+  #
+  # AND IT SERVES fraudTest.csv, which since the corpora were swapped is the
+  # right file: the stream must serve what the model was NOT trained on. The
+  # original exercise had it the other way round, and sampled the very file it
+  # trained on.
+  producer:
+    build: ./producer
+    environment:
+      PORT: "4000"
+      # THE SERVED WINDOW. 0 starts just after the training cut-off -- June and
+      # July 2020, the quietest baseline the corpus offers -- so an injected
+      # drift is the signal. 400000 lands in the December tail, where the base
+      # rate falls to 0.1849 % on its own: C6 demonstrated on a shift nobody
+      # forced. Changing either needs this service recreated.
+      PRODUCER_SKIP_ROWS: "${PRODUCER_SKIP_ROWS:-0}"
+      PRODUCER_MAX_ROWS: "${PRODUCER_MAX_ROWS:-100000}"
+      # 13/MINUTE, WHICH IS WHAT N0 MEASURED, not the 5/minute the original's
+      # source declares: the hosted Space let twelve through and refused the
+      # thirteenth, never below. governance.realtime calibrated calls_per_run
+      # on that figure and check_s3 makes it a criterion.
+      #
+      # IT WAS SET TO 5 AND THE INGESTION DIED ON IT, 2026-11-19 23:41 UTC.
+      # The comment here used to read "the ingestion sits ON the limit and
+      # fetch_one's 429 retry earns its place", which was wrong on its own
+      # terms: sitting on the limit is what makes the retry impossible. Five
+      # calls each retried once is up to ten requests a minute against a
+      # budget of five, and the overflow carried into the following run, which
+      # was refused on its FIRST call at 0.0 s. Ten under thirteen restores
+      # the margin dag_ingest's docstring claims. Empty disables the limiter,
+      # at the cost of EC25's 429 path becoming unreachable.
+      #
+      # VERIFIED, 2026-11-20 00:26 UTC
+      # (runtime/observations/n0-api-measure--20261120-0026.md): twenty
+      # calls back to back, in 0.365 s, so one window -- eight answered
+      # 200 and the twelve others 429. Eight and not thirteen, because
+      # dag_ingest was running and held five: under the LocalExecutor it
+      # runs in the same container as every measuring tool, and the
+      # producer keys its limiter on the client address, so they share one
+      # bucket. 8 + 5 = 13 closes the arithmetic and confirms this value
+      # is the one in force.
+      #
+      # AND IT CUTS BOTH WAYS. The ingestion asks for up to ten of the
+      # thirteen (five calls, each retried once on a 429), so a
+      # measurement campaign run beside it can starve the chain it is
+      # measuring. `fd-manager observe` now says so when dag_ingest is
+      # active, rather than leaving the figure to be misread.
+      PRODUCER_RATE_LIMIT: "${PRODUCER_RATE_LIMIT-13/minute}"
+      # The corpus's bucket and the credentials boto3 reads by itself. Needed
+      # for the FIRST start only: fetch_csv caches the file with its sha256 and
+      # every later start takes the cache.
+      ML4FD_CORPUS_BUCKET: ${ML4FD_CORPUS_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-3}
+    volumes:
+      # THE CACHE IS WRITABLE, and it is the only thing this service writes.
+      # It fetches its own corpus through ml4fd.fetch, into the same cache S1
+      # uses -- one acquisition path, one checksum discipline, one directory an
+      # operator can look at.
+      - ./.local_cache:/opt/project/.local_cache
+      # ml4fd/ MOUNTED rather than copied into the image: the service imports
+      # ml4fd.fetch, and a copy baked in would be a second version of the
+      # acquisition path.
+      - ./ml4fd:/opt/project/ml4fd:ro
+      # Read-only: the drift switch is read on every call, never written.
+      - ./runtime:/opt/project/runtime:ro
+      - ./governance.yml:/opt/project/governance.yml:ro
+    ports:
+      # Published to the loopback only: nothing outside this machine has
+      # business reading a stream of cardholder names. The scheduler reaches it
+      # on the CONTAINER port, 4000, inside the compose network.
+      - "127.0.0.1:8802:4000"
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: fd_dashboard
+      POSTGRES_PASSWORD: ${FD_DASHBOARD_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PYTHONPATH: /opt/project:/opt/project/dashboard
+    volumes:
+      - ./dashboard:/opt/project/dashboard:ro
+      - ./ml4fd:/opt/project/ml4fd:ro
+      - ./sql:/opt/project/sql:ro
+      - ./governance.yml:/opt/project/governance.yml:ro
+      - ./runtime/reports:/opt/project/runtime/reports:ro
+    ports:
+      - "127.0.0.1:8502:8501"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- L5
+  # THE SCORING SERVICE, decoupled from the pipeline. It answers about payments
+  # the pipeline has never seen, which is why it writes fd_scoring_service_calls and not
+  # fd_scores -- see sql/ddl/190_scoring_service_calls.sql.
+  scoring-service:
+    # BUILT FROM THE ROOT, since L6: the image carries its code (see
+    # scoring_service/Dockerfile and /.dockerignore). The name is the registry's,
+    # so the image the CI publishes and the image built here are one name; the
+    # tag says which. SCORING_SERVICE_TAG is set by the deployment, "local" for
+    # a build on this machine.
+    build:
+      context: .
+      dockerfile: scoring_service/Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-local}
+    image: ghcr.io/nicolaspichon-git/jedha-data-scientist-lead-bloc4--ml4fd-sources/scoring-service:${SCORING_SERVICE_TAG:-local}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "5000"
+      POSTGRES_HOST: postgres
+      # ITS OWN CREDENTIALS, never the owner's. 145_scoring_service_role.sql argues it: the
+      # two containers a network talks to must not be one SET ROLE away from
+      # the owner's privileges.
+      POSTGRES_USER: fd_scoring_service
+      POSTGRES_PASSWORD: ${FD_SCORING_SERVICE_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # THE PEPPER, which the dashboard deliberately does not receive. This
+      # service must compute the SAME pseudonym as the ingestion path, or a
+      # call and a transaction of one cardholder would stop joining -- so it
+      # needs the secret the HMAC is keyed on. It never writes it down.
+      ML4FD_PEPPER: ${ML4FD_PEPPER}
+      # The champion is resolved through the registry, like every other reader.
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI}
+      # THE REGISTRY ANSWERS FAST OR IS REPORTED ABSENT. MLflow's client retries
+      # several times with an exponential backoff by default: with mlflow down
+      # (2026-11-22), /health hung while it waited, the healthcheck (4 s)
+      # declared the container unhealthy, and the "degraded, not down" answer
+      # serve.health() is written to give never arrived. One retry about a
+      # second later, 5 s per request: an absent registry is reported in a
+      # second or two, and a single blip is still absorbed.
+      #
+      # INTEGERS, all three: MLflow types its own variables and converts them
+      # on first read. "0.5" here failed int() inside mlflow, every load of the
+      # champion with it, and the service answered degraded to every call
+      # (2026-11-22, the first deployment).
+      MLFLOW_HTTP_REQUEST_MAX_RETRIES: "1"
+      MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR: "1"
+      MLFLOW_HTTP_REQUEST_TIMEOUT: "5"
+    volumes:
+      # NO CODE IS MOUNTED, since L6: ml4fd/, sql/ and governance.yml are in the
+      # image, at the commit it was built from. What remains is DATA.
+      #
+      # THE MANIFESTS, AND NOT THE MODEL. Found missing on the first /health,
+      # 2026-11-20 22:38: the service resolved the champion in MLflow, read its
+      # dataset_version, and could not open run.json -- "Recipes present:
+      # aucune", because nothing of runtime/ was mounted here.
+      #
+      # score.load() loads the MODEL from the registry
+      # (mlflow.sklearn.load_model("models:/...")) and reads only the manifest
+      # from disk: the feature list, the threshold, and the digest it
+      # cross-checks against the run's logged parameters. That split is
+      # deliberate -- M8 wants the chain from a model back to its rows to
+      # survive a tracking server that is down, moved or wiped -- so the
+      # manifest lives beside the dataset and not only in MLflow.
+      #
+      # THE WHOLE DIRECTORY, because the manifests sit one per recipe folder
+      # beside the Parquet. What that grants is read access to the training
+      # splits, which carry datasets.STORED_COLUMNS and nothing else: txn_id,
+      # txn_ts, the features, the label. No client_key, no card number, no
+      # location -- the splits hold no identity by construction, and this
+      # service already reads three columns of fd_transactions, which is the
+      # stronger grant. Read-only: it opens a manifest, it never writes one.
+      - ./runtime/datasets:/opt/project/runtime/datasets:ro
+    # THIS MACHINE ONLY, like the dashboard. The service is reachable from the
+    # compose network as scoring-service:5000; a browser reaches it on 8012,
+    # the 8**2 family of every host port of this stack (see postgres).
+    ports:
+      - "127.0.0.1:8012:5000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # /health answers while no champion carries the alias -- degraded, not
+      # down -- so the check asks for a reachable endpoint and not for a model.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  mlruns:
+  airflow-logs:

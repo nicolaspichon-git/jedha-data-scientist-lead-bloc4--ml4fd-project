@@ -1,0 +1,20 @@
+.env
+__pycache__/
+*.py[cod]
+*.bak
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.local_cache/
+# Parquet datasets: data, not code. The registry in fd_datasets is what makes
+# them findable again, and the recipe digest is what makes them rebuildable.
+_to_delete/
+ws/
+runtime/reports/202*.*
+runtime/datasets/*
+runtime/producer/*
+runtime/channels/ops/*
+runtime/channels/frauds/*
+runtime/channels/monitoring/*
+runtime/observations/*
+runtime/deployments/*
