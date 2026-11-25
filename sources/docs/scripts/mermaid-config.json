@@ -1,0 +1,15 @@
+{
+  "theme": "default",
+  "themeVariables": {
+    "fontFamily": "Verdana, Geneva, sans-serif",
+    "fontSize": "14px"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "wrappingWidth": 260,
+    "nodeSpacing": 50,
+    "rankSpacing": 60,
+    "padding": 12,
+    "curve": "basis"
+  }
+}
